@@ -315,12 +315,10 @@ def validate_ci_client(client_flavour):
 )
 @click.option(
     "--admin-email",
-    required=True,
     help="Admin user email address",
 )
 @click.option(
     "--admin-password",
-    required=True,
     help="Admin user password",
 )
 @click.option(
@@ -352,9 +350,17 @@ def validate_ci_client(client_flavour):
     default="kind",
     help="What Kubernetes cluster to use? (kind, colima/k3s). [default=kind]",
 )
+@click.option(
+    "--submit-only", is_flag=True, help="Do not wait for workflows to finish."
+)
+@click.option(
+    "--check-only",
+    is_flag=True,
+    help="Do not build and deploy the cluster, only wait for previously submitted workflows.",
+)
 @client_option
 @run_commands.command(name="run-ci")
-def run_ci(
+def run_ci(  # noqa: C901
     build_arg,
     mode,
     exclude_components,
@@ -370,6 +376,8 @@ def run_ci(
     parallel,
     namespace,
     kubernetes,
+    submit_only,
+    check_only,
     client_flavour,
 ):  # noqa: D301
     """Run CI build.
@@ -390,6 +398,14 @@ def run_ci(
     arguments.
 
     \b
+    The demo examples can also be run in two steps, which allows to build and
+    deploy the cluster as fast as possible:
+       $ reana-dev run-ci --admin-email john.doe@example.org
+                          --admin-password mysecretpassword --submit-only
+       $ # ... wait some minutes
+       $ reana-dev run-ci --check-only
+
+    \b
     Example:
        $ reana-dev run-ci -m /var/reana:/var/reana
                           -m /usr/share/local/mydata:/mydata
@@ -402,56 +418,69 @@ def run_ci(
                           --admin-email john.doe@example.org
                           --admin-password mysecretpassword
     """
-    validate_ci_client(client_flavour)
+    if submit_only and check_only:
+        click.secho(
+            "[ERROR] Options --submit-only and --check-only are mutually exclusive. Choose only one."
+        )
+        sys.exit(1)
+    if not check_only and not (admin_email and admin_password):
+        click.secho(
+            "[ERROR] Options --admin-email and --admin-password are required, unless --check-only is used."
+        )
+        sys.exit(1)
+    # checking results does not rebuild the client, so it needs no build tools
+    if not check_only:
+        validate_ci_client(client_flavour)
     # parse arguments
     components = select_components(component)
-    # create cluster if needed
-    if not is_cluster_created(kubernetes):
-        cmd = f"reana-dev cluster-create --kubernetes {kubernetes} --mode {mode} --extra-ports {hostport}"
-        for mount in mounts:
-            cmd += " -m {}".format(mount)
-        if disable_default_cni:
-            cmd += " --disable-default-cni"
-        run_command(cmd, "reana")
-    # prefetch and load images for selected demo examples
-    if mode in ("releasepypi", "latest", "debug"):
-        for component in components:
-            for cmd in [
-                "reana-dev docker-pull -c {}".format(component),
-            ]:
-                run_command(cmd, "reana")
-            if kubernetes == "kind":
+    if not check_only:
+        # create cluster if needed
+        if not is_cluster_created(kubernetes):
+            cmd = f"reana-dev cluster-create --kubernetes {kubernetes} --mode {mode} --extra-ports {hostport}"
+            for mount in mounts:
+                cmd += " -m {}".format(mount)
+            if disable_default_cni:
+                cmd += " --disable-default-cni"
+            run_command(cmd, "reana")
+        # prefetch and load images for selected demo examples
+        if mode in ("releasepypi", "latest", "debug"):
+            for component in components:
                 for cmd in [
-                    "reana-dev kind-load-docker-image -c {}".format(component),
+                    "reana-dev docker-pull -c {}".format(component),
                 ]:
                     run_command(cmd, "reana")
-    # undeploy cluster and install latest client
-    for cmd in [
-        f"reana-dev cluster-undeploy --kubernetes {kubernetes}",
-        "reana-dev client-install",
-    ]:
-        run_command(cmd, "reana")
-    # build cluster
-    if mode in ("releasepypi", "latest", "debug"):
-        cmd = f"reana-dev cluster-build --kubernetes {kubernetes} --mode {mode}"
+                if kubernetes == "kind":
+                    for cmd in [
+                        "reana-dev kind-load-docker-image -c {}".format(component),
+                    ]:
+                        run_command(cmd, "reana")
+        # undeploy cluster and install latest client
+        for cmd in [
+            f"reana-dev cluster-undeploy --kubernetes {kubernetes}",
+            "reana-dev client-install",
+        ]:
+            run_command(cmd, "reana")
+        # build cluster
+        if mode in ("releasepypi", "latest", "debug"):
+            cmd = f"reana-dev cluster-build --kubernetes {kubernetes} --mode {mode}"
+            if exclude_components:
+                cmd += " --exclude-components {}".format(exclude_components)
+            for arg in build_arg:
+                cmd += " -b {0}".format(arg)
+            if no_cache:
+                cmd += " --no-cache"
+            cmd += f" --parallel {parallel}"
+            run_command(cmd, "reana")
+        # deploy cluster
+        cmd = (
+            f"reana-dev cluster-deploy --mode {mode} --namespace {namespace}"
+            f" --admin-email {admin_email} --admin-password {admin_password}"
+        )
         if exclude_components:
             cmd += " --exclude-components {}".format(exclude_components)
-        for arg in build_arg:
-            cmd += " -b {0}".format(arg)
-        if no_cache:
-            cmd += " --no-cache"
-        cmd += f" --parallel {parallel}"
+        for job_mount in job_mounts:
+            cmd += " -j {}".format(job_mount)
         run_command(cmd, "reana")
-    # deploy cluster
-    cmd = (
-        f"reana-dev cluster-deploy --mode {mode} --namespace {namespace}"
-        f" --admin-email {admin_email} --admin-password {admin_password}"
-    )
-    if exclude_components:
-        cmd += " --exclude-components {}".format(exclude_components)
-    for job_mount in job_mounts:
-        cmd += " -j {}".format(job_mount)
-    run_command(cmd, "reana")
     # run demo examples
     cmd = (
         f"eval $(reana-dev client-setup-environment --server-hostname "
@@ -462,6 +491,10 @@ def run_ci(
         cmd += " -c {}".format(component)
     for a_workflow_engine in workflow_engine:
         cmd += " -w {}".format(a_workflow_engine)
+    if submit_only:
+        cmd += " --submit-only"
+    elif check_only:
+        cmd += " --check-only"
     run_command(cmd, "reana")
 
 
