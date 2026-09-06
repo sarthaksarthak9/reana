@@ -235,6 +235,40 @@ def test_job_controller_receives_vetted_container_images(
     not shutil.which("helm"),
     reason="helm must be installed",
 )
+def test_pull_through_cache_reaches_server_and_job_controller(tmp_path):
+    """Pull-through cache settings must reach the components pulling user images."""
+    cache = {
+        "enabled": True,
+        "registry": "registry.cern.ch",
+        "upstream_registries": ["docker.io"],
+    }
+    rendered = _render_helm_chart(
+        tmp_path, {"container_image_pull_through_cache": cache}
+    )
+
+    server_env = None
+    job_controller_env = None
+    for document in _rendered_documents(rendered):
+        if document.get("kind") != "Deployment":
+            continue
+        for container in document["spec"]["template"]["spec"]["containers"]:
+            for env_var in container.get("env", []):
+                if env_var["name"] == "REANA_CONTAINER_IMAGE_PULL_THROUGH_CACHE":
+                    server_env = env_var["value"]
+                elif env_var["name"] == "REANA_JOB_CONTROLLER_ENV_VARS":
+                    job_controller_env = json.loads(env_var["value"])
+
+    assert json.loads(server_env) == cache
+    assert (
+        json.loads(job_controller_env["REANA_CONTAINER_IMAGE_PULL_THROUGH_CACHE"])
+        == cache
+    )
+
+
+@pytest.mark.skipif(
+    not shutil.which("helm"),
+    reason="helm must be installed",
+)
 @pytest.mark.parametrize(
     "shared_storage",
     [
