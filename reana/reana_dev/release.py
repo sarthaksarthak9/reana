@@ -8,6 +8,7 @@
 
 """`reana-dev`'s release commands."""
 
+import json
 import os
 import subprocess
 import sys
@@ -17,6 +18,7 @@ from time import sleep
 
 import click
 
+from reana.config import GITHUB_RELEASE_TITLE_COMPONENT_NAMES
 from reana.reana_dev.git import (
     get_current_commit,
     git_clean,
@@ -69,6 +71,21 @@ def is_component_releasable(component, exit_code=False, display=False):
         sys.exit(1)
 
     return is_releasable
+
+
+def get_expected_github_release_title(component, tag):
+    """Determine the expected GitHub release title of a component release.
+
+    :param component: Component the release belongs to.
+    :param tag: Git tag of the release, such as '0.9.4'.
+
+    :type component: str
+    :type tag: str
+    :rtype: str
+    """
+    version = tag[1:] if tag.startswith("v") else tag
+    component_name = GITHUB_RELEASE_TITLE_COMPONENT_NAMES[component]
+    return f"{component_name} {version}".strip()
 
 
 @click.group()
@@ -469,6 +486,173 @@ def release_docker_copy(
                 f"{component_}: copied {src_image} to {dst_image}",
                 fg="green",
             )
+
+
+@click.option(
+    "--component",
+    "-c",
+    required=True,
+    multiple=True,
+    help="Which components? [name|CLUSTER]",
+)
+@click.option(
+    "--tag",
+    "-t",
+    "tags",
+    multiple=True,
+    help="Which release tags? [default=latest release]",
+)
+@click.option(
+    "--all-releases",
+    is_flag=True,
+    default=False,
+    help="Amend the titles of all the past releases? [default=False]",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Display the commands without executing them. [default=False]",
+)
+@release_commands.command(name="release-github-title")
+def release_github_title(component, tags, all_releases, dry_run):  # noqa: D301
+    """Amend the GitHub release titles of the released components.
+
+    GitHub releases are created by Release Please, which titles them after the
+    released version only, such as ``v0.9.4``. This command amends the titles
+    to follow the REANA convention of using the human-readable component name
+    followed by the released version, such as ``REANA-Client 0.9.4``.
+
+    By default, only the latest release of each component is amended. Use
+    ``--tag`` to amend one or more given releases, or ``--all-releases`` to
+    amend all the past releases of the selected components.
+
+    \b
+    :param components: The option ``component`` can be repeated. The value may
+                       consist of:
+                         * (1) standard component name such as
+                               'reana-workflow-controller';
+                         * (2) short component name such as 'r-w-controller';
+                         * (3) special value '.' indicating component of the
+                               current working directory;
+                         * (4) special value 'CLUSTER' that will expand to
+                               cover all REANA cluster components [default];
+                         * (5) special value 'CLIENT' that will expand to
+                               cover all REANA client components;
+                         * (6) special value 'DEMO' that will expand
+                               to include several runable REANA demo examples;
+                         * (7) special value 'ALL' that will expand to include
+                               all REANA repositories.
+    :param tags: Git tags of the releases to amend. [default=latest release]
+    :param all_releases: Amend all the past releases of the components. [default=False]
+    :param dry_run: Display the commands without executing them. [default=False]
+    :type component: str
+    :type tags: list
+    :type all_releases: bool
+    :type dry_run: bool
+    """
+    if tags and all_releases:
+        click.secho(
+            "Please use either --tag or --all-releases, not both.",
+            fg="red",
+        )
+        sys.exit(1)
+
+    if not which("gh"):
+        click.secho(
+            "Please install GitHub CLI (gh) to be able to amend release titles.",
+            fg="red",
+        )
+        sys.exit(1)
+
+    components = select_components(component)
+
+    if tags and len(components) > 1:
+        click.secho("Cannot use --tag with multiple components.", fg="red")
+        sys.exit(1)
+
+    for component_ in components:
+        if component_ not in GITHUB_RELEASE_TITLE_COMPONENT_NAMES:
+            display_message(
+                "Component is not released on GitHub, skipping.", component_
+            )
+            continue
+
+        repository = f"reanahub/{component_}"
+        if tags:
+            releases = [
+                json.loads(
+                    run_command(
+                        [
+                            "gh",
+                            "release",
+                            "view",
+                            tag,
+                            "-R",
+                            repository,
+                            "--json",
+                            "tagName,name",
+                        ],
+                        display=False,
+                        return_output=True,
+                    )
+                )
+                for tag in tags
+            ]
+        else:
+            releases = json.loads(
+                run_command(
+                    [
+                        "gh",
+                        "release",
+                        "list",
+                        "-R",
+                        repository,
+                        "--exclude-drafts",
+                        "--limit",
+                        "1000" if all_releases else "1",
+                        "--json",
+                        "tagName,name",
+                    ],
+                    display=False,
+                    return_output=True,
+                )
+            )
+
+        if not releases:
+            display_message("No GitHub releases found, skipping.", component_)
+            continue
+
+        for release in releases:
+            tag_name = release["tagName"]
+            expected_title = get_expected_github_release_title(component_, tag_name)
+            if release["name"] == expected_title:
+                display_message(
+                    f"Release {tag_name} is already titled "
+                    f"'{expected_title}', skipping.",
+                    component_,
+                )
+                continue
+
+            run_command(
+                [
+                    "gh",
+                    "release",
+                    "edit",
+                    tag_name,
+                    "-R",
+                    repository,
+                    "--title",
+                    expected_title,
+                ],
+                dry_run=dry_run,
+            )
+            if not dry_run:
+                click.secho(
+                    f"{component_}: release {tag_name} was retitled to "
+                    f"'{expected_title}'",
+                    fg="green",
+                )
 
 
 release_commands_list = list(release_commands.commands.values())
