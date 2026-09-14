@@ -78,6 +78,15 @@ REPO_LIST_CLIENT = [
 ]
 """List of git repositories related to command line clients."""
 
+CLIENT_FLAVOUR_EXECUTABLES = {
+    "python": "reana-client",
+    "go": "reana-client-go",
+}
+"""Command line client flavours and their executable names."""
+
+CLIENT_FLAVOUR_DEFAULT = "python"
+"""Command line client flavour that ``reana-dev`` drives by default."""
+
 REPO_LIST_CLUSTER_INFRASTRUCTURE = [
     "reana-ui",
     "reana-message-broker",

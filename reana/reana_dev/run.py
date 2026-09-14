@@ -10,6 +10,7 @@
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -20,6 +21,8 @@ import yaml
 import click
 
 from reana.config import (
+    CLIENT_FLAVOUR_DEFAULT,
+    CLIENT_FLAVOUR_EXECUTABLES,
     COMPUTE_BACKEND_LIST_ALL,
     EXAMPLE_LOG_MESSAGES,
     EXAMPLE_NON_STANDARD_REANA_YAML_FILENAME,
@@ -28,6 +31,7 @@ from reana.config import (
     TIMEOUT,
     WORKFLOW_ENGINE_LIST_ALL,
 )
+from reana.reana_dev.client import get_missing_go_build_tools
 from reana.reana_dev.utils import (
     display_message,
     get_srcdir,
@@ -141,7 +145,7 @@ def select_workflow_engines(workflow_engines):
     return list(output)
 
 
-def select_compute_backends(compute_backends):
+def select_compute_backends(compute_backends, client_executable):
     """Return known compute backends names that REANA supports.
 
     :param workflow_engines: A list of compute backends names such as 'slurmcern'.
@@ -154,7 +158,7 @@ def select_compute_backends(compute_backends):
 
     def _has_cern_secrets():
         """Check whether the test user has the correct CERN secrets?."""
-        output = subprocess.check_output(["reana-client", "secrets-list"]).decode(
+        output = subprocess.check_output([client_executable, "secrets-list"]).decode(
             "UTF-8"
         )
         required_cern_secrets = [
@@ -236,6 +240,32 @@ def get_example_reana_yaml_file_path(example, workflow_engine, compute_backend):
 @click.group()
 def run_commands():
     """Run commands group."""
+
+
+def client_option(func):
+    """Add a command line client flavour option to a command."""
+    return click.option(
+        "--client",
+        "client_flavour",
+        type=click.Choice(list(CLIENT_FLAVOUR_EXECUTABLES)),
+        default=CLIENT_FLAVOUR_DEFAULT,
+        show_default=True,
+        help="Which command line client to drive?",
+    )(func)
+
+
+def validate_ci_client(client_flavour):
+    """Check build prerequisites for the client selected for CI."""
+    if client_flavour == "go":
+        missing_tools = get_missing_go_build_tools()
+        if missing_tools:
+            click.secho(
+                "[ERROR] Cannot run CI with the Go client because these "
+                f"build tools were not found: {', '.join(missing_tools)}. "
+                "Install them and rerun `reana-dev run-ci --client go`.",
+                fg="red",
+            )
+            sys.exit(1)
 
 
 @click.option(
@@ -322,6 +352,7 @@ def run_commands():
     default="kind",
     help="What Kubernetes cluster to use? (kind, colima/k3s). [default=kind]",
 )
+@client_option
 @run_commands.command(name="run-ci")
 def run_ci(
     build_arg,
@@ -339,10 +370,13 @@ def run_ci(
     parallel,
     namespace,
     kubernetes,
+    client_flavour,
 ):  # noqa: D301
     """Run CI build.
 
     Builds and installs REANA and runs a demo example.
+
+    Selecting the Go client requires Go and make to rebuild it from source.
 
     \b
     Basically it runs the following sequence of commands:
@@ -350,7 +384,7 @@ def run_ci(
        $ reana-dev cluster-undeploy
        $ reana-dev cluster-build
        $ reana-dev cluster-deploy
-       $ eval "$(reana-dev client-setup-environment)" && reana-dev run-example
+       $ eval "$(reana-dev client-setup-environment)" && reana-dev run-example --client CLIENT
 
     in the appropriate order and with the appropriate mounting or debugging
     arguments.
@@ -368,6 +402,7 @@ def run_ci(
                           --admin-email john.doe@example.org
                           --admin-password mysecretpassword
     """
+    validate_ci_client(client_flavour)
     # parse arguments
     components = select_components(component)
     # create cluster if needed
@@ -418,7 +453,11 @@ def run_ci(
         cmd += " -j {}".format(job_mount)
     run_command(cmd, "reana")
     # run demo examples
-    cmd = f"eval $(reana-dev client-setup-environment --server-hostname https://localhost:{hostport} -n {namespace}) && reana-dev run-example"
+    cmd = (
+        f"eval $(reana-dev client-setup-environment --server-hostname "
+        f"https://localhost:{hostport} -n {namespace}) && "
+        f"reana-dev run-example --client {client_flavour}"
+    )
     for component in components:
         cmd += " -c {}".format(component)
     for a_workflow_engine in workflow_engine:
@@ -486,6 +525,7 @@ def run_ci(
 @click.option(
     "--check-only", is_flag=True, help="Wait for previously submitted workflows."
 )
+@client_option
 @run_commands.command(name="run-example")
 def run_example(  # noqa: C901
     component,
@@ -498,6 +538,7 @@ def run_example(  # noqa: C901
     options,
     submit_only,
     check_only,
+    client_flavour,
 ):  # noqa: D301
     """Run given REANA example with given workflow engine.
 
@@ -546,9 +587,27 @@ def run_example(  # noqa: C901
             "[ERROR] Options --submit-only and --check-only are mutually exclusive. Choose only one."
         )
         sys.exit(1)
+
+    client_executable = CLIENT_FLAVOUR_EXECUTABLES[client_flavour]
+    if not shutil.which(client_executable):
+        installation_hint = "Please run `reana-dev client-install` first."
+        if client_flavour == "go":
+            installation_hint = (
+                "Please ensure Go and make are available, then run "
+                "`reana-dev client-install`."
+            )
+        click.secho(
+            f"[ERROR] Could not find '{client_executable}' executable. "
+            f"{installation_hint}",
+            fg="red",
+        )
+        sys.exit(1)
+
     components = sorted(select_components(component))
     workflow_engines = sorted(select_workflow_engines(workflow_engine))
-    compute_backends = sorted(select_compute_backends(compute_backend))
+    compute_backends = sorted(
+        select_compute_backends(compute_backend, client_executable)
+    )
 
     def _format_report(elements) -> str:
         return f": {', '.join(elements)}" if elements else ""
@@ -594,10 +653,10 @@ def run_example(  # noqa: C901
                 )
 
                 if not check_only:
-                    create_workflow_cmd = f"reana-client create -f {reana_yaml_file_path} -n {workflow_name}"
+                    create_workflow_cmd = f"{client_executable} create -f {reana_yaml_file_path} -n {workflow_name}"
                     run_command(create_workflow_cmd, component)
 
-                    upload_inputs_cmd = f"reana-client upload -w {workflow_name}"
+                    upload_inputs_cmd = f"{client_executable} upload -w {workflow_name}"
                     run_command(upload_inputs_cmd, component)
 
                     # run workflow
@@ -607,7 +666,7 @@ def run_example(  # noqa: C901
                     operational_options = " ".join(
                         ["-o " + option for option in options]
                     )
-                    run_workflow_cmd = f"reana-client start -w {workflow_name} {input_parameters} {operational_options}"
+                    run_workflow_cmd = f"{client_executable} start -w {workflow_name} {input_parameters} {operational_options}"
                     run_command(run_workflow_cmd, component)
 
                 if not submit_only and not check_only:
@@ -615,7 +674,7 @@ def run_example(  # noqa: C901
                     time_start = time.time()
                     while time.time() - time_start <= timeout:
                         time.sleep(timecheck)
-                        cmd = f"reana-client status -w {workflow_name}"
+                        cmd = f"{client_executable} status -w {workflow_name}"
                         status = run_command(cmd, component, return_output=True)
                         click.secho(status)
                         if (
@@ -627,7 +686,7 @@ def run_example(  # noqa: C901
 
                 # check only is here
                 if not submit_only:
-                    cmd = f"reana-client status -w {workflow_name}"
+                    cmd = f"{client_executable} status -w {workflow_name}"
                     status = run_command(cmd, component, return_output=True)
                     click.secho(status)
 
@@ -647,7 +706,7 @@ def run_example(  # noqa: C901
                             for log_message in get_expected_log_messages_for_example(
                                 component
                             ):
-                                cmd = f"reana-client logs -w {workflow_name} | grep '{log_message}' | wc -l"
+                                cmd = f"{client_executable} logs -w {workflow_name} | grep '{log_message}' | wc -l"
                                 cmd_output = run_command(
                                     cmd, component, return_output=True
                                 )
@@ -655,7 +714,7 @@ def run_example(  # noqa: C901
                                 if int(cmd_output) == 0:
                                     passed = False
                             if passed:
-                                cmd = f"reana-client ls -w {workflow_name}"
+                                cmd = f"{client_executable} ls -w {workflow_name}"
                                 listing = run_command(
                                     cmd, component, return_output=True
                                 )
@@ -676,7 +735,7 @@ def run_example(  # noqa: C901
                         else:
                             try:
                                 tests = run_command(
-                                    f"reana-client test -w {workflow_name}",
+                                    f"{client_executable} test -w {workflow_name}",
                                     component,
                                     return_output=True,
                                 )

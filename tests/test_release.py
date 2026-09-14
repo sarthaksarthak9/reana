@@ -173,3 +173,39 @@ def test_release_github_title_skips_unreleased_components():
     assert result.exit_code == 0
     assert not executed_commands
     assert "not released on GitHub" in result.output
+
+
+def test_release_github_title_requires_gh():
+    """Test that the command fails when GitHub CLI is not installed."""
+    with patch("reana.reana_dev.release.which", return_value=None), patch(
+        "reana.reana_dev.release.run_command"
+    ) as mock_run_command:
+        result = CliRunner().invoke(
+            reana_dev, ["release-github-title", "-c", "reana-client"]
+        )
+
+    assert result.exit_code == 1
+    assert "Please install GitHub CLI" in result.output
+    mock_run_command.assert_not_called()
+
+
+def test_release_github_title_tag_with_multiple_components():
+    """Test that --tag cannot be used with multiple components."""
+    result, executed_commands = _run_release_github_title(
+        ["-c", "reana-client", "-c", "reana-db", "--tag", "0.9.5"], []
+    )
+
+    assert result.exit_code == 1
+    assert "Cannot use --tag with multiple components" in result.output
+    assert not executed_commands
+
+
+def test_release_github_title_no_releases():
+    """Test that components without any GitHub releases are skipped."""
+    result, executed_commands = _run_release_github_title(
+        ["-c", "reana-workflow-validator"], []
+    )
+
+    assert result.exit_code == 0
+    assert "No GitHub releases found" in result.output
+    assert not any("edit" in cmd for cmd in executed_commands)
